@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"late/internal/client"
+	"late/internal/common"
 )
 
 // Context-exhaustion safeguard (Phase B): the executor's programmatic hook
@@ -52,6 +53,14 @@ type CompactionReport struct {
 	// ShadowOnly marks a report-only run: it computed would-save numbers
 	// and rewrote nothing, so it cannot recover an over-limit request.
 	ShadowOnly bool
+	// Profile is the caller's one-line history breakdown (per-message role
+	// and token estimate), set when the passes freed nothing. It is appended
+	// to the terminal guidance so the persistent transcript error card —
+	// not the transient toast — carries WHY nothing could be freed: which
+	// messages hold the context (huge opener, tail-sized tool result, many
+	// medium ones) is exactly what the protection rules must be reasoned
+	// about from.
+	Profile string
 }
 
 // ErrCompactionUnavailable is returned by the installed compactor closure
@@ -74,24 +83,52 @@ const maxContextCompactionRounds = 2
 var (
 	contextCompactorMu sync.RWMutex
 	contextCompactor   ContextCompactor
+	// sessionCompactors holds per-session compactor closures keyed by
+	// orchestrator ID. Subagents run their own histories through the same
+	// RunLoop safeguard, and compacting the root's history cannot recover an
+	// over-limit SUBAGENT request — each orchestrator registers a closure
+	// over its own session so the guard always shrinks the conversation the
+	// failing request actually carries.
+	sessionCompactors map[string]ContextCompactor
 )
 
 // SetContextCompactor installs c as the process-wide context-exhaustion
-// compactor consulted by RunLoop's safeguard. The root agent and every
-// subagent share it, mirroring SetToolResultCompactor: a single session
-// compactor closure, installed once at startup (cmd/late) with the root
-// session's history. Pass nil to disable the safeguard — RunLoop then
-// surfaces ErrContextExceeded with its recovery guidance untouched.
+// compactor consulted by RunLoop's safeguard when no per-session compactor
+// matches the running orchestrator. Pass nil to disable the safeguard —
+// RunLoop then surfaces ErrContextExceeded with its recovery guidance
+// untouched.
 func SetContextCompactor(c ContextCompactor) {
 	contextCompactorMu.Lock()
 	defer contextCompactorMu.Unlock()
 	contextCompactor = c
 }
 
-// getContextCompactor returns the installed compactor (nil when none).
-func getContextCompactor() ContextCompactor {
+// SetSessionContextCompactor installs c as the compactor for the orchestrator
+// identified by id (root or subagent). Passing nil removes the entry.
+func SetSessionContextCompactor(id string, c ContextCompactor) {
+	contextCompactorMu.Lock()
+	defer contextCompactorMu.Unlock()
+	if sessionCompactors == nil {
+		sessionCompactors = make(map[string]ContextCompactor)
+	}
+	if c == nil {
+		delete(sessionCompactors, id)
+		return
+	}
+	sessionCompactors[id] = c
+}
+
+// getContextCompactor returns the compactor for the orchestrator running in
+// ctx (its ID is injected at Execute time), falling back to the process-wide
+// compactor when no per-session entry matches. Nil when neither is installed.
+func getContextCompactor(ctx context.Context) ContextCompactor {
 	contextCompactorMu.RLock()
 	defer contextCompactorMu.RUnlock()
+	if id := common.GetOrchestratorID(ctx); id != "" {
+		if c, ok := sessionCompactors[id]; ok {
+			return c
+		}
+	}
 	return contextCompactor
 }
 
@@ -144,7 +181,7 @@ func (o contextCompactionOutcome) freedSomething() bool {
 // always surfaced to the caller — both the retry status line and the
 // terminal error carry the compaction summary verbatim.
 func runContextCompaction(ctx context.Context) contextCompactionOutcome {
-	c := getContextCompactor()
+	c := getContextCompactor(ctx)
 	if c == nil {
 		return contextCompactionOutcome{err: ErrCompactionUnavailable}
 	}
@@ -155,11 +192,16 @@ func runContextCompaction(ctx context.Context) contextCompactionOutcome {
 // contextExceededGuidance renders the terminal error surfaced when the
 // guard cannot recover: the typed guidance (what happened, the manual
 // recovery steps) plus the observed compaction outcome so the user knows
-// WHY the automatic path gave up.
+// WHY the automatic path gave up. When the caller supplied a history
+// profile, it is appended — the transcript renders this error as a
+// persistent card, which is the readable surface a 6-second toast is not.
 func contextExceededGuidance(err error, outcome contextCompactionOutcome) error {
 	summary := outcome.summary()
 	if outcome.err == nil && !outcome.freedSomething() {
 		summary = freedNothingSummary
+	}
+	if outcome.report.Profile != "" {
+		summary += "; " + normalizeContextGuidance(outcome.report.Profile)
 	}
 	return fmt.Errorf("%w: %s", err, summary)
 }

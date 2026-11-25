@@ -71,7 +71,7 @@ func mustContextClient(t *testing.T, baseURL string, ctxSize int) *client.Client
 // in the package must not observe this one's hook).
 func installCompactor(t *testing.T, c ContextCompactor) {
 	t.Helper()
-	prev := getContextCompactor()
+	prev := getContextCompactor(context.Background())
 	SetContextCompactor(c)
 	t.Cleanup(func() { SetContextCompactor(prev) })
 }
@@ -377,4 +377,63 @@ func TestRunLoopPredictiveCompactionSkippedWithoutWindowOrHook(t *testing.T) {
 			t.Errorf("server got %d POSTs, want 1 (no heuristic → the request proceeds as always)", got)
 		}
 	})
+}
+
+// TestSessionContextCompactorResolvesByOrchestratorID pins the per-session
+// resolution: with a ctx carrying a subagent's orchestrator ID, the
+// subagent's registered compactor wins over the process-wide one, so the
+// guard compacts the conversation the failing request actually carries.
+func TestSessionContextCompactorResolvesByOrchestratorID(t *testing.T) {
+	const childID = "main#coder-1"
+
+	var rootRuns, childRuns atomic.Int64
+	rootCompactor := func(ctx context.Context) (CompactionReport, error) {
+		rootRuns.Add(1)
+		return CompactionReport{TokensSaved: 1}, nil
+	}
+	childCompactor := func(ctx context.Context) (CompactionReport, error) {
+		childRuns.Add(1)
+		return CompactionReport{TokensSaved: 2}, nil
+	}
+
+	prev := getContextCompactor(context.Background())
+	SetContextCompactor(rootCompactor)
+	SetSessionContextCompactor(childID, childCompactor)
+	t.Cleanup(func() {
+		SetContextCompactor(prev)
+		SetSessionContextCompactor(childID, nil)
+	})
+
+	childCtx := context.WithValue(context.Background(), common.OrchestratorIDKey, childID)
+
+	// The child's ctx resolves the child's compactor...
+	if got := getContextCompactor(childCtx); got == nil {
+		t.Fatal("getContextCompactor(childCtx) = nil, want the child's compactor")
+	}
+	if _, err := getContextCompactor(childCtx)(context.Background()); err != nil {
+		t.Fatalf("child compactor returned error: %v", err)
+	}
+	// ...while a ctx without an orchestrator ID falls back to the
+	// process-wide compactor.
+	if _, err := getContextCompactor(context.Background())(context.Background()); err != nil {
+		t.Fatalf("root compactor returned error: %v", err)
+	}
+	if got := childRuns.Load(); got != 1 {
+		t.Errorf("child compactor ran %d times, want 1 (resolved by ctx ID)", got)
+	}
+	if got := rootRuns.Load(); got != 1 {
+		t.Errorf("root compactor ran %d times, want 1 (fallback without ctx ID)", got)
+	}
+
+	// Removal via nil reverts to the process-wide fallback.
+	SetSessionContextCompactor(childID, nil)
+	if _, err := getContextCompactor(childCtx)(context.Background()); err != nil {
+		t.Fatalf("fallback root compactor returned error: %v", err)
+	}
+	if got := rootRuns.Load(); got != 2 {
+		t.Errorf("root compactor ran %d times, want 2 (fallback after child removal)", got)
+	}
+	if got := childRuns.Load(); got != 1 {
+		t.Errorf("child compactor ran %d times, want 1 (not invoked after removal)", got)
+	}
 }

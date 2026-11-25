@@ -428,7 +428,7 @@ func RunLoop(
 			// predict against, and without a compactor the reactive
 			// failure path is the only behavior.
 			if !predictiveCompactionDone {
-				if ctxSize := sess.Client().ContextSize(); ctxSize > 0 && getContextCompactor() != nil {
+				if ctxSize := sess.Client().ContextSize(); ctxSize > 0 && getContextCompactor(ctx) != nil {
 					// The estimate is cached across the attempt loop: a failed
 					// attempt commits nothing, so history is byte-identical on
 					// every retry of this turn — re-tokenizing the whole

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"late/internal/assets"
@@ -150,6 +151,38 @@ func NewSubagentOrchestrator(
 
 	child := orchestrator.NewBaseOrchestrator(id, sess, mws, maxTurns)
 	child.SetContext(parent.Context())
+
+	// Register this child's own context compactor so the executor's
+	// context-exhaustion safeguard compacts the SUBAGENT's history when its
+	// request hits the model's window — compacting the root's history
+	// instead would shrink a different conversation and recover nothing.
+	// Subagent histories are small and ephemeral, so the registration is
+	// never reaped; it only ever fires when this child's own RunLoop runs.
+	// The outcome is announced through the messenger (a TUI diagnostic
+	// toast): the child's status line is only visible while focused, so the
+	// toast is the surface the user reliably sees.
+	executor.SetSessionContextCompactor(id, func(ctx context.Context) (executor.CompactionReport, error) {
+		tokensSaved, messagesCompacted, err := sess.CompactContext(ctx)
+		if err != nil {
+			if messenger != nil {
+				messenger.Send(tui.DiagnosticMsg{Text: fmt.Sprintf("subagent %s: context auto-compaction failed: %v", id, err)})
+			}
+			return executor.CompactionReport{}, err
+		}
+		if tokensSaved > 0 && messenger != nil {
+			messenger.Send(tui.DiagnosticMsg{Text: fmt.Sprintf("subagent %s: context auto-compacted: saved ~%d tokens (%d messages)", id, tokensSaved, messagesCompacted)})
+		}
+		// The passes freed nothing: attach the one-line history profile to
+		// the report so the persistent transcript error card carries why.
+		report := executor.CompactionReport{
+			TokensSaved:       tokensSaved,
+			MessagesCompacted: messagesCompacted,
+		}
+		if tokensSaved == 0 {
+			report.Profile = sess.HistoryProfile()
+		}
+		return report, nil
+	})
 
 	if p, ok := parent.(*orchestrator.BaseOrchestrator); ok {
 		p.AddChild(child)

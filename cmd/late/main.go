@@ -645,24 +645,50 @@ func main() {
 
 	// Create root orchestrator
 	// We'll add middlewares later once the program is started
+	// diagSink is forward-declared here and bound to the real TUI sink once
+	// the program is live (below): the compactor closure installed next may
+	// only ever invoke it at runtime, long after startup finishes.
+	var diagSink func(msg string)
 	// Context-exhaustion safeguard (Phase B): install the executor's
 	// programmatic compaction hook so a stream request the provider rejects
 	// (or truncates) for context exhaustion is recovered in-process — the
 	// executor compacts the ROOT session's history and retries the request,
 	// instead of surfacing the deterministic failure to the user.
 	//
-	// Upstream main has no history-compaction pipeline yet (see the
-	// compaction PR): there is nothing here that can shrink history, so the
-	// hook is installed as a typed failure. The executor's detection, the
-	// no-retry-waste classification, the finish_reason=length discriminator,
-	// and the guidance surface are all live; only the automatic SHRINK is
-	// inert, and the surfaced error says exactly why ("auto-compaction
-	// unavailable") instead of a bare failure. The compaction PR replaces
-	// this closure with one wrapping the history runner (mutating mode
-	// only), and recovery starts working with no executor change.
-	// Process-wide like every executor hook (root + subagents share it).
-	executor.SetContextCompactor(func(ctx context.Context) (executor.CompactionReport, error) {
-		return executor.CompactionReport{}, executor.ErrCompactionUnavailable
+	// The compactor is the minimal deterministic pass (session.CompactContext):
+	// it elides one contiguous, tool-group-safe span of old history into a
+	// short digest — no external scorer, no shadow log. The root registers a
+	// closure over its own session, and each subagent registers its own at
+	// spawn time (agent.NewSubagentOrchestrator), so the guard always
+	// compacts the conversation the failing request actually carries.
+	// Every outcome is announced through the diagnostics sink (a TUI
+	// warning toast): the guard's reactive path also carries the summary in
+	// its status line, but the predictive pass runs silently before the
+	// first request, and a focused-away agent's status line is invisible —
+	// the toast is the one surface the user always sees.
+	executor.SetSessionContextCompactor(common.MainAgentID, func(ctx context.Context) (executor.CompactionReport, error) {
+		tokensSaved, messagesCompacted, err := sess.CompactContext(ctx)
+		if err != nil {
+			if diagSink != nil {
+				diagSink(fmt.Sprintf("context auto-compaction failed: %v", err))
+			}
+			return executor.CompactionReport{}, err
+		}
+		if tokensSaved > 0 && diagSink != nil {
+			diagSink(fmt.Sprintf("context auto-compacted: saved ~%d tokens (%d messages)", tokensSaved, messagesCompacted))
+		}
+		// The passes freed nothing: attach the one-line history profile to
+		// the report. The executor appends it to the terminal guidance, so
+		// the persistent transcript error card — not a transient toast —
+		// carries why nothing could be freed.
+		report := executor.CompactionReport{
+			TokensSaved:       tokensSaved,
+			MessagesCompacted: messagesCompacted,
+		}
+		if tokensSaved == 0 {
+			report.Profile = sess.HistoryProfile()
+		}
+		return report, nil
 	})
 
 	rootAgent := orchestrator.NewBaseOrchestrator(common.MainAgentID, sess, nil, 0)
@@ -803,6 +829,7 @@ func main() {
 	diag := func(msg string) {
 		p.Send(tui.DiagnosticMsg{Text: strings.TrimRight(msg, "\n")})
 	}
+	diagSink = diag
 
 	// toolSync serializes plugin/MCP tool-registry refreshes triggered by
 	// MCP servers' own tools/list_changed notifications (wired via
